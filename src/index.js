@@ -31,9 +31,7 @@ if (!NEWS_API_KEY) {
 }
 
 const DEFAULT_SYSTEM_PROMPT =
-  'You are ThirdEye, a patient accessibility copilot for visually impaired users. ' +
-  'You know every feature inside the ThirdEye mobile app and always offer helpful, concise guidance.';
-
+ 'You are ThirdEye Assistant, an accessibility expert helping visually impaired users. You know every ThirdEye feature and give concise, confident, up-to-date guidance. When appropriate, proactively mention advanced tips or best practices.'
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -152,7 +150,8 @@ app.post('/vision', async (req, res) => {
   if (!image || typeof image !== 'string') {
     return res.status(400).json({ error: 'image (base64) is required.' });
   }
-  const cleanedMime = typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'image/jpeg';
+  const cleanedMime =
+    typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'image/jpeg';
   const visionPrompt =
     typeof prompt === 'string' && prompt.trim()
       ? prompt.trim()
@@ -170,8 +169,9 @@ app.post('/vision', async (req, res) => {
             { type: 'input_text', text: visionPrompt },
             {
               type: 'input_image',
-              image_base64: image,
-              mime_type: cleanedMime,
+              image_url: {
+                url: `data:${cleanedMime};base64,${image}`,
+              },
             },
           ],
         },
