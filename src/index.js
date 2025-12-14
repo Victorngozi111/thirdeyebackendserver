@@ -31,7 +31,9 @@ if (!NEWS_API_KEY) {
 }
 
 const DEFAULT_SYSTEM_PROMPT =
- 'You are ThirdEye Assistant, an accessibility expert helping visually impaired users. You know every ThirdEye feature and give concise, confident, up-to-date guidance. When appropriate, proactively mention advanced tips or best practices.'
+  'You are ThirdEye, a patient accessibility copilot for visually impaired users. ' +
+  'You know every feature inside the ThirdEye mobile app and always offer helpful, concise guidance.';
+
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -119,11 +121,12 @@ app.post('/chat', async (req, res) => {
   if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'prompt is required' });
   }
-  const userContent = [];
-  userContent.push({ type: 'input_text', text: prompt.trim() });
+
+  const userContent = [{ type: 'input_text', text: prompt.trim() }];
   if (text && typeof text === 'string' && text.trim()) {
     userContent.push({ type: 'input_text', text: text.trim() });
   }
+
   try {
     const reply = await callOpenAiResponses({
       input: [
@@ -150,12 +153,14 @@ app.post('/vision', async (req, res) => {
   if (!image || typeof image !== 'string') {
     return res.status(400).json({ error: 'image (base64) is required.' });
   }
+
   const cleanedMime =
     typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'image/jpeg';
   const visionPrompt =
     typeof prompt === 'string' && prompt.trim()
       ? prompt.trim()
       : 'Describe the image for someone who cannot see it. Focus on key details and helpful context.';
+
   try {
     const reply = await callOpenAiResponses({
       input: [
@@ -169,9 +174,7 @@ app.post('/vision', async (req, res) => {
             { type: 'input_text', text: visionPrompt },
             {
               type: 'input_image',
-              image_url: {
-                url: `data:${cleanedMime};base64,${image}`,
-              },
+              image_url: `data:${cleanedMime};base64,${image}`,
             },
           ],
         },
@@ -190,10 +193,12 @@ app.post('/text', async (req, res) => {
   if (typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ error: 'text is required.' });
   }
+
   const summaryPrompt =
     typeof prompt === 'string' && prompt.trim()
       ? prompt.trim()
       : 'Summarize the following content for accessibility, highlighting key actions and insights.';
+
   try {
     const reply = await callOpenAiResponses({
       input: [
@@ -223,6 +228,7 @@ app.post('/audio/speech', async (req, res) => {
   if (typeof input !== 'string' || !input.trim()) {
     return res.status(400).json({ error: 'input text is required.' });
   }
+
   try {
     const response = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
@@ -232,10 +238,12 @@ app.post('/audio/speech', async (req, res) => {
       },
       body: JSON.stringify({ model, voice, input: input.trim() }),
     });
+
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`OpenAI TTS error ${response.status}: ${errorText}`);
     }
+
     const buffer = Buffer.from(await response.arrayBuffer());
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Length', buffer.length);
@@ -250,6 +258,7 @@ app.get('/news/headlines', async (req, res) => {
   if (!NEWS_API_KEY) {
     return res.status(503).json({ error: 'News service is not configured on this server.' });
   }
+
   const {
     country = 'us',
     category = 'all',
