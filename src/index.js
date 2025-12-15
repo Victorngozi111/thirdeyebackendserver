@@ -66,15 +66,37 @@ function decodeResponseText(response) {
   return null;
 }
 
-function normaliseImagePayload(image, mimeType = 'image/jpeg') {
+function buildInputImageContent(image, mimeType = 'image/jpeg') {
   if (typeof image !== 'string' || image.trim().length === 0) {
     throw new Error('Missing or invalid image payload');
   }
+
   const trimmed = image.trim();
-  if (trimmed.startsWith('data:')) {
-    return trimmed;
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return {
+      type: 'input_image',
+      image_url: { url: trimmed },
+    };
   }
-  return `data:${mimeType};base64,${trimmed}`;
+
+  let base64Data = trimmed;
+  if (trimmed.startsWith('data:')) {
+    const commaIndex = trimmed.indexOf(',');
+    if (commaIndex === -1) {
+      throw new Error('Malformed data URI image payload');
+    }
+    base64Data = trimmed.substring(commaIndex + 1).trim();
+  }
+
+  if (!base64Data) {
+    throw new Error('Empty image payload');
+  }
+
+  return {
+    type: 'input_image',
+    image_base64: base64Data,
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -122,7 +144,12 @@ app.post('/vision', authorize, async (req, res) => {
   try {
     const { image, prompt, mime_type: mimeType = 'image/jpeg', model } =
       req.body ?? {};
-    const imageUrl = normaliseImagePayload(image, mimeType);
+    if (!image || typeof image !== 'string') {
+      return res
+        .status(400)
+        .json({ message: 'Request must include an image to analyse.' });
+    }
+    const imageContent = buildInputImageContent(image, mimeType);
 
     const response = await openai.responses.create({
       model: model || OPENAI_VISION_MODEL,
@@ -134,7 +161,7 @@ app.post('/vision', authorize, async (req, res) => {
               type: 'input_text',
               text: prompt?.trim() || defaultVisionPrompt,
             },
-            { type: 'input_image', image_url: imageUrl },
+            imageContent,
           ],
         },
       ],
