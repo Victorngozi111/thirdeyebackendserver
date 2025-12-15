@@ -56,7 +56,6 @@ function decodeResponseText(response) {
   }
   return null;
 }
-
 function buildInputImageContent(image, mimeType = 'image/jpeg') {
   if (typeof image !== 'string' || image.trim().length === 0) {
     throw new Error('Missing or invalid image payload');
@@ -65,13 +64,8 @@ function buildInputImageContent(image, mimeType = 'image/jpeg') {
   const trimmed = image.trim();
 
   if (/^https?:\/\//i.test(trimmed)) {
-    return {
-      type: 'input_image',
-      image_url: { url: trimmed },
-    };
+    return { type: 'input_image', image_url: trimmed };
   }
-
-  let dataUrl = trimmed;
 
   if (trimmed.startsWith('data:')) {
     const commaIndex = trimmed.indexOf(',');
@@ -82,17 +76,12 @@ function buildInputImageContent(image, mimeType = 'image/jpeg') {
     if (!payload) {
       throw new Error('Empty image payload');
     }
-    dataUrl = trimmed;
-  } else {
-    if (!trimmed) {
-      throw new Error('Empty image payload');
-    }
-    dataUrl = `data:${mimeType};base64,${trimmed}`;
+    return { type: 'input_image', image_url: trimmed };
   }
 
   return {
     type: 'input_image',
-    image_url: { url: dataUrl },
+    image_url: `data:${mimeType};base64,${trimmed}`,
   };
 }
 
