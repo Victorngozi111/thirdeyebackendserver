@@ -15,17 +15,11 @@ const {
   OPENAI_AUDIO_MODEL = 'gpt-4o-mini-tts',
 } = process.env;
 
-// -----------------------------------------------------------------------------
-// OpenAI client
-// -----------------------------------------------------------------------------
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
   project: OPENAI_PROJECT_ID,
 });
 
-// -----------------------------------------------------------------------------
-// Express app configuration
-// -----------------------------------------------------------------------------
 const app = express();
 app.set('trust proxy', true);
 
@@ -41,9 +35,6 @@ app.use(cors());
 app.use(express.json({ limit: '16mb' }));
 app.use(morgan('combined'));
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
 const defaultVisionPrompt =
   'Describe the image for a blind user. Give a concise scene summary then list key objects with position and colours. Mention any signs, hazards, or people. Keep it under 180 words.';
 
@@ -80,28 +71,31 @@ function buildInputImageContent(image, mimeType = 'image/jpeg') {
     };
   }
 
-  let base64Data = trimmed;
+  let dataUrl = trimmed;
+
   if (trimmed.startsWith('data:')) {
     const commaIndex = trimmed.indexOf(',');
     if (commaIndex === -1) {
       throw new Error('Malformed data URI image payload');
     }
-    base64Data = trimmed.substring(commaIndex + 1).trim();
-  }
-
-  if (!base64Data) {
-    throw new Error('Empty image payload');
+    const payload = trimmed.substring(commaIndex + 1).trim();
+    if (!payload) {
+      throw new Error('Empty image payload');
+    }
+    dataUrl = trimmed;
+  } else {
+    if (!trimmed) {
+      throw new Error('Empty image payload');
+    }
+    dataUrl = `data:${mimeType};base64,${trimmed}`;
   }
 
   return {
     type: 'input_image',
-    image_base64: base64Data,
+    image_url: { url: dataUrl },
   };
 }
 
-// -----------------------------------------------------------------------------
-// Routes
-// -----------------------------------------------------------------------------
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -253,9 +247,6 @@ app.post('/audio/speech', authorize, async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// Start server
-// -----------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`ThirdEye backend listening on port ${PORT}`);
 });
