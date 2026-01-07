@@ -13,6 +13,7 @@ const {
   OPENAI_CHAT_MODEL = 'gpt-4.1-mini',
   OPENAI_VISION_MODEL = 'gpt-4.1',
   OPENAI_AUDIO_MODEL = 'gpt-4o-mini-tts',
+  OPENAI_IMAGE_MODEL = 'gpt-image-1', // new
 } = process.env;
 
 const openai = new OpenAI({
@@ -22,6 +23,49 @@ const openai = new OpenAI({
 
 const app = express();
 app.set('trust proxy', 1);
+
+// In-memory daily quota store: { [userId]: { date: 'YYYY-MM-DD', count: number } }
+const DAILY_IMAGE_LIMIT = 5;
+const imageQuota = new Map();
+
+function todayKeyUtc() {
+  const now = new Date();
+  return now.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function getUserId(req) {
+  const headerId = req.header('x-user-id');
+  if (headerId && headerId.trim().length > 0) return headerId.trim();
+  return req.ip || 'anonymous';
+}
+
+function enforceDailyImageQuota(req, res, next) {
+  const userId = getUserId(req);
+  const today = todayKeyUtc();
+  const record = imageQuota.get(userId);
+  if (!record || record.date !== today) {
+    imageQuota.set(userId, { date: today, count: 0 });
+    return next();
+  }
+  if (record.count >= DAILY_IMAGE_LIMIT) {
+    return res
+      .status(429)
+      .json({ message: 'Daily free image limit reached. Try again tomorrow.' });
+  }
+  return next();
+}
+
+function incrementQuota(req) {
+  const userId = getUserId(req);
+  const today = todayKeyUtc();
+  const record = imageQuota.get(userId);
+  if (!record || record.date !== today) {
+    imageQuota.set(userId, { date: today, count: 1 });
+  } else {
+    record.count += 1;
+    imageQuota.set(userId, record);
+  }
+}
 
 app.use(
   rateLimit({
@@ -180,6 +224,41 @@ app.post('/audio/speech', authorize, async (req, res) => {
   } catch (error) {
     console.error('[speech] error', error);
     return res.status(500).json({ message: 'Text-to-speech failed. Please try again.' });
+  }
+});
+
+// New: image generation with 5/day quota
+app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
+  try {
+    const { prompt, size = '1024x1024', quality = 'standard', style = 'vivid' } = req.body ?? {};
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ message: 'Request must include an image prompt.' });
+    }
+
+    const response = await openai.images.generate({
+      model: OPENAI_IMAGE_MODEL,
+      prompt: prompt.trim(),
+      n: 1,
+      size,
+      quality,
+      style,
+    });
+
+    const image = response?.data?.[0];
+    if (!image?.url) {
+      return res.status(502).json({ message: 'Image generation failed. Please try again.' });
+    }
+
+    incrementQuota(req);
+    return res.json({ url: image.url });
+  } catch (error) {
+    console.error('[image] error', error);
+    if (error?.status === 429) {
+      return res
+        .status(429)
+        .json({ message: 'Upstream image rate limit hit. Please retry shortly.' });
+    }
+    return res.status(500).json({ message: 'Image generation failed. Please try again.' });
   }
 });
 
