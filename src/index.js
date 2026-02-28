@@ -13,24 +13,26 @@ const {
   OPENAI_CHAT_MODEL = 'gpt-4.1-mini',
   OPENAI_VISION_MODEL = 'gpt-4.1',
   OPENAI_AUDIO_MODEL = 'gpt-4o-mini-tts',
-  OPENAI_IMAGE_MODEL = 'gpt-image-1', 
+  OPENAI_IMAGE_MODEL = 'gpt-image-1',
 } = process.env;
+
+if (!OPENAI_API_KEY) {
+  console.error('[startup] Missing OPENAI_API_KEY');
+}
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
-  project: OPENAI_PROJECT_ID,
+  project: OPENAI_PROJECT_ID || undefined,
 });
 
 const app = express();
 app.set('trust proxy', 1);
 
-// In-memory daily quota store: { [userId]: { date: 'YYYY-MM-DD', count: number } }
 const DAILY_IMAGE_LIMIT = 5;
 const imageQuota = new Map();
 
 function todayKeyUtc() {
-  const now = new Date();
-  return now.toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date().toISOString().slice(0, 10);
 }
 
 function getUserId(req) {
@@ -43,15 +45,18 @@ function enforceDailyImageQuota(req, res, next) {
   const userId = getUserId(req);
   const today = todayKeyUtc();
   const record = imageQuota.get(userId);
+
   if (!record || record.date !== today) {
     imageQuota.set(userId, { date: today, count: 0 });
     return next();
   }
+
   if (record.count >= DAILY_IMAGE_LIMIT) {
     return res
       .status(429)
       .json({ message: 'Daily free image limit reached. Try again tomorrow.' });
   }
+
   return next();
 }
 
@@ -59,6 +64,7 @@ function incrementQuota(req) {
   const userId = getUserId(req);
   const today = todayKeyUtc();
   const record = imageQuota.get(userId);
+
   if (!record || record.date !== today) {
     imageQuota.set(userId, { date: today, count: 1 });
   } else {
@@ -102,10 +108,13 @@ function buildInputImageContent(image, mimeType = 'image/jpeg') {
   if (typeof image !== 'string' || image.trim().length === 0) {
     throw new Error('Missing or invalid image payload');
   }
+
   const trimmed = image.trim();
+
   if (/^https?:\/\//i.test(trimmed)) {
     return { type: 'input_image', image_url: trimmed };
   }
+
   if (trimmed.startsWith('data:')) {
     const commaIndex = trimmed.indexOf(',');
     if (commaIndex === -1) throw new Error('Malformed data URI image payload');
@@ -113,7 +122,41 @@ function buildInputImageContent(image, mimeType = 'image/jpeg') {
     if (!payload) throw new Error('Empty image payload');
     return { type: 'input_image', image_url: trimmed };
   }
+
   return { type: 'input_image', image_url: `data:${mimeType};base64,${trimmed}` };
+}
+
+function parseIntSafe(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+function normalizeImageSize({ width, height, size }) {
+  const allowed = new Set(['1024x1024', '1536x1024', '1024x1536']);
+
+  if (typeof size === 'string' && allowed.has(size.trim())) {
+    return size.trim();
+  }
+
+  const w = parseIntSafe(width);
+  const h = parseIntSafe(height);
+
+  if (w && h) {
+    const candidate = `${w}x${h}`;
+    if (allowed.has(candidate)) return candidate;
+
+    if (w > h) return '1536x1024';
+    if (h > w) return '1024x1536';
+    return '1024x1024';
+  }
+
+  return '1024x1024';
+}
+
+function sanitizeQuality(value) {
+  const q = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') return q;
+  return 'auto';
 }
 
 app.get('/health', (_req, res) => {
@@ -126,17 +169,20 @@ app.post('/chat', authorize, async (req, res) => {
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ message: 'Request must include a text prompt.' });
     }
+
     const response = await openai.responses.create({
       model: OPENAI_CHAT_MODEL,
       input: [{ role: 'user', content: [{ type: 'input_text', text: prompt.trim() }] }],
     });
+
     const message = decodeResponseText(response);
     if (!message) {
       return res.status(502).json({ message: 'Assistant response was empty. Please try again.' });
     }
+
     return res.json({ message });
   } catch (error) {
-    console.error('[chat] error', error);
+    console.error('[chat] error', error?.status, error?.message, error);
     return res.status(500).json({ message: 'Assistant service unavailable. Please try again.' });
   }
 });
@@ -147,27 +193,28 @@ app.post('/vision', authorize, async (req, res) => {
     if (!image || typeof image !== 'string') {
       return res.status(400).json({ message: 'Request must include an image to analyse.' });
     }
+
     const imageContent = buildInputImageContent(image, mimeType);
+
     const response = await openai.responses.create({
       model: model || OPENAI_VISION_MODEL,
       input: [
         {
           role: 'user',
-          content: [
-            { type: 'input_text', text: prompt?.trim() || defaultVisionPrompt },
-            imageContent,
-          ],
+          content: [{ type: 'input_text', text: prompt?.trim() || defaultVisionPrompt }, imageContent],
         },
       ],
     });
+
     const message = decodeResponseText(response);
     if (!message) {
       return res.status(502).json({ message: 'Vision response was empty. Please try again.' });
     }
+
     return res.json({ message });
   } catch (error) {
-    console.error('[vision] error', error);
-    if (error?.response?.status === 400) {
+    console.error('[vision] error', error?.status, error?.message, error);
+    if (error?.status === 400) {
       return res.status(400).json({ message: 'The image data provided was invalid.' });
     }
     return res.status(500).json({ message: 'Vision service unavailable. Please try again.' });
@@ -180,6 +227,7 @@ app.post('/text', authorize, async (req, res) => {
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ message: 'Request must include text to summarise.' });
     }
+
     const response = await openai.responses.create({
       model: OPENAI_CHAT_MODEL,
       input: [
@@ -197,13 +245,15 @@ app.post('/text', authorize, async (req, res) => {
         },
       ],
     });
+
     const message = decodeResponseText(response);
     if (!message) {
       return res.status(502).json({ message: 'Summary response was empty. Please try again.' });
     }
+
     return res.json({ message });
   } catch (error) {
-    console.error('[text] error', error);
+    console.error('[text] error', error?.status, error?.message, error);
     return res.status(500).json({ message: 'Text summarisation failed. Please try again.' });
   }
 });
@@ -214,19 +264,20 @@ app.post('/audio/speech', authorize, async (req, res) => {
     if (!input || typeof input !== 'string') {
       return res.status(400).json({ message: 'Request must include text input.' });
     }
+
     const speech = await openai.audio.speech.create({
       model: OPENAI_AUDIO_MODEL,
       voice,
       input: input.trim(),
     });
+
     res.setHeader('Content-Type', 'audio/mpeg');
     return res.send(Buffer.from(await speech.arrayBuffer()));
   } catch (error) {
-    console.error('[speech] error', error);
+    console.error('[speech] error', error?.status, error?.message, error);
     return res.status(500).json({ message: 'Text-to-speech failed. Please try again.' });
   }
 });
-
 
 app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
   try {
@@ -235,33 +286,27 @@ app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
       return res.status(400).json({ message: 'Request must include an image prompt.' });
     }
 
-    // Normalize size from either "size" or width/height
-    const normalizedSize =
-      typeof size === 'string' && /^\d+x\d+$/.test(size)
-        ? size
-        : Number.isFinite(width) && Number.isFinite(height)
-        ? `${width}x${height}`
-        : '1024x1024';
+    const normalizedSize = normalizeImageSize({ width, height, size });
+    const normalizedQuality = sanitizeQuality(quality);
 
-    // Keep user "style" in prompt text, DO NOT send as API style param
-    // because app style is free text and can break OpenAI style validation.
-    const finalPrompt = prompt.trim();
-
+    // IMPORTANT:
+    // Do not pass free-text style field from client to API style parameter.
+    // Keep style words inside prompt text on the client side.
     const response = await openai.images.generate({
       model: OPENAI_IMAGE_MODEL,
-      prompt: finalPrompt,
+      prompt: prompt.trim(),
       size: normalizedSize,
-      // use only safe quality values for gpt-image-1
-      quality: ['low', 'medium', 'high', 'auto'].includes(quality) ? quality : 'auto',
+      quality: normalizedQuality,
       n: 1,
-      response_format: 'b64_json',
     });
 
     const image = response?.data?.[0];
+
     if (image?.b64_json) {
       incrementQuota(req);
       return res.json({ b64_json: image.b64_json });
     }
+
     if (image?.url) {
       incrementQuota(req);
       return res.json({ url: image.url });
@@ -277,6 +322,19 @@ app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
     if (error?.status === 429) {
       return res.status(429).json({ message: 'Upstream image rate limit hit. Please retry shortly.' });
     }
+
     return res.status(500).json({ message: 'Image generation failed. Please try again.' });
   }
+});
+
+app.use((err, _req, res, _next) => {
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ message: 'Payload too large. Keep images/text under 16MB.' });
+  }
+  console.error('[unhandled]', err);
+  return res.status(500).json({ message: 'Unexpected server error.' });
+});
+
+app.listen(PORT, () => {
+  console.log(`ThirdEye backend listening on port ${PORT}`);
 });
