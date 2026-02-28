@@ -13,7 +13,7 @@ const {
   OPENAI_CHAT_MODEL = 'gpt-4.1-mini',
   OPENAI_VISION_MODEL = 'gpt-4.1',
   OPENAI_AUDIO_MODEL = 'gpt-4o-mini-tts',
-  OPENAI_IMAGE_MODEL = 'gpt-image-1', // new
+  OPENAI_IMAGE_MODEL = 'gpt-image-1', 
 } = process.env;
 
 const openai = new OpenAI({
@@ -227,49 +227,56 @@ app.post('/audio/speech', authorize, async (req, res) => {
   }
 });
 
-// New: image generation with 5/day quota
+
 app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
   try {
-    const { prompt, size = '1024x1024', quality = 'standard', style = 'vivid' } = req.body ?? {};
+    const { prompt, width, height, size, quality } = req.body ?? {};
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ message: 'Request must include an image prompt.' });
     }
 
+    // Normalize size from either "size" or width/height
+    const normalizedSize =
+      typeof size === 'string' && /^\d+x\d+$/.test(size)
+        ? size
+        : Number.isFinite(width) && Number.isFinite(height)
+        ? `${width}x${height}`
+        : '1024x1024';
+
+    // Keep user "style" in prompt text, DO NOT send as API style param
+    // because app style is free text and can break OpenAI style validation.
+    const finalPrompt = prompt.trim();
+
     const response = await openai.images.generate({
       model: OPENAI_IMAGE_MODEL,
-      prompt: prompt.trim(),
+      prompt: finalPrompt,
+      size: normalizedSize,
+      // use only safe quality values for gpt-image-1
+      quality: ['low', 'medium', 'high', 'auto'].includes(quality) ? quality : 'auto',
       n: 1,
-      size,
-      quality,
-      style,
+      response_format: 'b64_json',
     });
 
     const image = response?.data?.[0];
-    if (!image?.url) {
-      return res.status(502).json({ message: 'Image generation failed. Please try again.' });
+    if (image?.b64_json) {
+      incrementQuota(req);
+      return res.json({ b64_json: image.b64_json });
+    }
+    if (image?.url) {
+      incrementQuota(req);
+      return res.json({ url: image.url });
     }
 
-    incrementQuota(req);
-    return res.json({ url: image.url });
+    return res.status(502).json({ message: 'Image generation returned no image payload.' });
   } catch (error) {
-    console.error('[image] error', error);
+    console.error('[image] error', error?.status, error?.message, error?.error || error);
+
+    if (error?.status === 400) {
+      return res.status(400).json({ message: 'Invalid image request parameters.' });
+    }
     if (error?.status === 429) {
-      return res
-        .status(429)
-        .json({ message: 'Upstream image rate limit hit. Please retry shortly.' });
+      return res.status(429).json({ message: 'Upstream image rate limit hit. Please retry shortly.' });
     }
     return res.status(500).json({ message: 'Image generation failed. Please try again.' });
   }
-});
-
-app.use((err, _req, res, _next) => {
-  if (err?.type === 'entity.too.large') {
-    return res.status(413).json({ message: 'Payload too large. Keep images/text under 16MB.' });
-  }
-  console.error('[unhandled]', err);
-  return res.status(500).json({ message: 'Unexpected server error.' });
-});
-
-app.listen(PORT, () => {
-  console.log(`ThirdEye backend listening on port ${PORT}`);
 });
