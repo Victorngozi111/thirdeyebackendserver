@@ -1,10 +1,4 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import rateLimit from 'express-rate-limit';
-import morgan from 'morgan';
-import OpenAI from 'openai';
-
+// 1) Add NEWS_API_KEY in env destructuring
 const {
   PORT = 8080,
   SERVICE_API_KEY,
@@ -14,327 +8,100 @@ const {
   OPENAI_VISION_MODEL = 'gpt-4.1',
   OPENAI_AUDIO_MODEL = 'gpt-4o-mini-tts',
   OPENAI_IMAGE_MODEL = 'gpt-image-1',
+  NEWS_API_KEY,
 } = process.env;
 
-if (!OPENAI_API_KEY) {
-  console.error('[startup] Missing OPENAI_API_KEY');
+// 2) Add helpers (near your other helper functions)
+const NEWSDATA_BASE_URL = 'https://newsdata.io/api/1/latest';
+
+function normalizeCountry(value) {
+  const v = String(value || 'us').trim().toLowerCase();
+  return v || 'us';
+}
+function normalizeLanguage(value) {
+  const v = String(value || 'en').trim().toLowerCase();
+  return v || 'en';
+}
+function normalizeCategory(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (!v || v === 'all') return null;
+  return v;
+}
+function mapNewsDataResults(results, { country, category }) {
+  if (!Array.isArray(results)) return [];
+  return results
+    .map((item, index) => {
+      const title = item?.title?.trim() || 'Untitled';
+      const link = item?.link?.trim() || item?.url?.trim() || '';
+      if (!link) return null;
+      return {
+        article_id: item?.article_id || `${Date.now()}-${index}`,
+        title,
+        link,
+        description: item?.description || item?.content || '',
+        image_url: item?.image_url || item?.image || null,
+        source_id: item?.source_id || item?.source || 'Unknown Source',
+        pubDate: item?.pubDate || item?.publishedAt || new Date().toISOString(),
+        country: [country],
+        category: [category || 'general'],
+      };
+    })
+    .filter(Boolean);
 }
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  project: OPENAI_PROJECT_ID || undefined,
-});
+// 3) Add routes (after /health is fine)
+app.get(
+  [
+    '/news',
+    '/news/latest',
+    '/news/headlines',
+    '/news/top-headlines',
+    '/api/news',
+    '/api/news/latest',
+    '/api/news/headlines',
+    '/api/news/top-headlines',
+  ],
+  authorize,
+  async (req, res) => {
+    try {
+      if (!NEWS_API_KEY) {
+        return res.status(500).json({ message: 'Missing NEWS_API_KEY on server.', results: [] });
+      }
 
-const app = express();
-app.set('trust proxy', 1);
+      const country = normalizeCountry(req.query.country);
+      const language = normalizeLanguage(req.query.language);
+      const category = normalizeCategory(req.query.category);
+      const q = String(req.query.q || '').trim();
 
-const DAILY_IMAGE_LIMIT = 5;
-const imageQuota = new Map();
+      const url = new URL(NEWSDATA_BASE_URL);
+      url.searchParams.set('apikey', NEWS_API_KEY);
+      url.searchParams.set('country', country);
+      url.searchParams.set('language', language);
+      if (category) url.searchParams.set('category', category);
+      if (q) url.searchParams.set('q', q);
 
-function todayKeyUtc() {
-  return new Date().toISOString().slice(0, 10);
-}
+      const upstream = await fetch(url.toString());
+      const text = await upstream.text();
 
-function getUserId(req) {
-  const headerId = req.header('x-user-id');
-  if (headerId && headerId.trim().length > 0) return headerId.trim();
-  return req.ip || 'anonymous';
-}
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return res.status(502).json({ message: 'News provider returned invalid JSON.', results: [] });
+      }
 
-function enforceDailyImageQuota(req, res, next) {
-  const userId = getUserId(req);
-  const today = todayKeyUtc();
-  const record = imageQuota.get(userId);
+      if (!upstream.ok) {
+        return res.status(upstream.status).json({
+          message: data?.message || `News upstream failed (${upstream.status}).`,
+          results: [],
+        });
+      }
 
-  if (!record || record.date !== today) {
-    imageQuota.set(userId, { date: today, count: 0 });
-    return next();
+      const mapped = mapNewsDataResults(data?.results || [], { country, category });
+      return res.json({ status: 'success', totalResults: mapped.length, results: mapped });
+    } catch (error) {
+      console.error('[news] error', error?.message || error);
+      return res.status(500).json({ message: 'News service unavailable right now.', results: [] });
+    }
   }
-
-  if (record.count >= DAILY_IMAGE_LIMIT) {
-    return res
-      .status(429)
-      .json({ message: 'Daily free image limit reached. Try again tomorrow.' });
-  }
-
-  return next();
-}
-
-function incrementQuota(req) {
-  const userId = getUserId(req);
-  const today = todayKeyUtc();
-  const record = imageQuota.get(userId);
-
-  if (!record || record.date !== today) {
-    imageQuota.set(userId, { date: today, count: 1 });
-  } else {
-    record.count += 1;
-    imageQuota.set(userId, record);
-  }
-}
-
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 60,
-    standardHeaders: true,
-    legacyHeaders: false,
-  }),
 );
-app.use(cors());
-app.use(express.json({ limit: '16mb' }));
-app.use(morgan('combined'));
-
-const defaultVisionPrompt =
-  'Describe the image for a blind user. Give a concise scene summary then list key objects with position and colours. Mention any signs, hazards, or people. Keep it under 180 words.';
-
-function authorize(req, res, next) {
-  if (!SERVICE_API_KEY) return next();
-  const incoming = req.header('x-api-key');
-  if (incoming && incoming.trim() === SERVICE_API_KEY.trim()) return next();
-  console.warn('[auth] 401', req.path);
-  return res.status(401).json({ message: 'Unauthorized' });
-}
-
-function decodeResponseText(response) {
-  const output = response?.output_text;
-  if (typeof output === 'string' && output.trim().length > 0) {
-    return output.trim();
-  }
-  return null;
-}
-
-function buildInputImageContent(image, mimeType = 'image/jpeg') {
-  if (typeof image !== 'string' || image.trim().length === 0) {
-    throw new Error('Missing or invalid image payload');
-  }
-
-  const trimmed = image.trim();
-
-  if (/^https?:\/\//i.test(trimmed)) {
-    return { type: 'input_image', image_url: trimmed };
-  }
-
-  if (trimmed.startsWith('data:')) {
-    const commaIndex = trimmed.indexOf(',');
-    if (commaIndex === -1) throw new Error('Malformed data URI image payload');
-    const payload = trimmed.substring(commaIndex + 1).trim();
-    if (!payload) throw new Error('Empty image payload');
-    return { type: 'input_image', image_url: trimmed };
-  }
-
-  return { type: 'input_image', image_url: `data:${mimeType};base64,${trimmed}` };
-}
-
-function parseIntSafe(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.round(n) : null;
-}
-
-function normalizeImageSize({ width, height, size }) {
-  const allowed = new Set(['1024x1024', '1536x1024', '1024x1536']);
-
-  if (typeof size === 'string' && allowed.has(size.trim())) {
-    return size.trim();
-  }
-
-  const w = parseIntSafe(width);
-  const h = parseIntSafe(height);
-
-  if (w && h) {
-    const candidate = `${w}x${h}`;
-    if (allowed.has(candidate)) return candidate;
-
-    if (w > h) return '1536x1024';
-    if (h > w) return '1024x1536';
-    return '1024x1024';
-  }
-
-  return '1024x1024';
-}
-
-function sanitizeQuality(value) {
-  const q = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (q === 'low' || q === 'medium' || q === 'high' || q === 'auto') return q;
-  return 'auto';
-}
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.post('/chat', authorize, async (req, res) => {
-  try {
-    const { prompt } = req.body ?? {};
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ message: 'Request must include a text prompt.' });
-    }
-
-    const response = await openai.responses.create({
-      model: OPENAI_CHAT_MODEL,
-      input: [{ role: 'user', content: [{ type: 'input_text', text: prompt.trim() }] }],
-    });
-
-    const message = decodeResponseText(response);
-    if (!message) {
-      return res.status(502).json({ message: 'Assistant response was empty. Please try again.' });
-    }
-
-    return res.json({ message });
-  } catch (error) {
-    console.error('[chat] error', error?.status, error?.message, error);
-    return res.status(500).json({ message: 'Assistant service unavailable. Please try again.' });
-  }
-});
-
-app.post('/vision', authorize, async (req, res) => {
-  try {
-    const { image, prompt, mime_type: mimeType = 'image/jpeg', model } = req.body ?? {};
-    if (!image || typeof image !== 'string') {
-      return res.status(400).json({ message: 'Request must include an image to analyse.' });
-    }
-
-    const imageContent = buildInputImageContent(image, mimeType);
-
-    const response = await openai.responses.create({
-      model: model || OPENAI_VISION_MODEL,
-      input: [
-        {
-          role: 'user',
-          content: [{ type: 'input_text', text: prompt?.trim() || defaultVisionPrompt }, imageContent],
-        },
-      ],
-    });
-
-    const message = decodeResponseText(response);
-    if (!message) {
-      return res.status(502).json({ message: 'Vision response was empty. Please try again.' });
-    }
-
-    return res.json({ message });
-  } catch (error) {
-    console.error('[vision] error', error?.status, error?.message, error);
-    if (error?.status === 400) {
-      return res.status(400).json({ message: 'The image data provided was invalid.' });
-    }
-    return res.status(500).json({ message: 'Vision service unavailable. Please try again.' });
-  }
-});
-
-app.post('/text', authorize, async (req, res) => {
-  try {
-    const { text, prompt } = req.body ?? {};
-    if (!text || typeof text !== 'string') {
-      return res.status(400).json({ message: 'Request must include text to summarise.' });
-    }
-
-    const response = await openai.responses.create({
-      model: OPENAI_CHAT_MODEL,
-      input: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text:
-                (prompt?.trim() ||
-                  'Summarise the following text for accessibility. Highlight key actions, people, and any warnings.') +
-                `\n\n${text.trim()}`,
-            },
-          ],
-        },
-      ],
-    });
-
-    const message = decodeResponseText(response);
-    if (!message) {
-      return res.status(502).json({ message: 'Summary response was empty. Please try again.' });
-    }
-
-    return res.json({ message });
-  } catch (error) {
-    console.error('[text] error', error?.status, error?.message, error);
-    return res.status(500).json({ message: 'Text summarisation failed. Please try again.' });
-  }
-});
-
-app.post('/audio/speech', authorize, async (req, res) => {
-  try {
-    const { input, voice = 'alloy' } = req.body ?? {};
-    if (!input || typeof input !== 'string') {
-      return res.status(400).json({ message: 'Request must include text input.' });
-    }
-
-    const speech = await openai.audio.speech.create({
-      model: OPENAI_AUDIO_MODEL,
-      voice,
-      input: input.trim(),
-    });
-
-    res.setHeader('Content-Type', 'audio/mpeg');
-    return res.send(Buffer.from(await speech.arrayBuffer()));
-  } catch (error) {
-    console.error('[speech] error', error?.status, error?.message, error);
-    return res.status(500).json({ message: 'Text-to-speech failed. Please try again.' });
-  }
-});
-
-app.post('/image', authorize, enforceDailyImageQuota, async (req, res) => {
-  try {
-    const { prompt, width, height, size, quality } = req.body ?? {};
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ message: 'Request must include an image prompt.' });
-    }
-
-    const normalizedSize = normalizeImageSize({ width, height, size });
-    const normalizedQuality = sanitizeQuality(quality);
-
-    // IMPORTANT:
-    // Do not pass free-text style field from client to API style parameter.
-    // Keep style words inside prompt text on the client side.
-    const response = await openai.images.generate({
-      model: OPENAI_IMAGE_MODEL,
-      prompt: prompt.trim(),
-      size: normalizedSize,
-      quality: normalizedQuality,
-      n: 1,
-    });
-
-    const image = response?.data?.[0];
-
-    if (image?.b64_json) {
-      incrementQuota(req);
-      return res.json({ b64_json: image.b64_json });
-    }
-
-    if (image?.url) {
-      incrementQuota(req);
-      return res.json({ url: image.url });
-    }
-
-    return res.status(502).json({ message: 'Image generation returned no image payload.' });
-  } catch (error) {
-    console.error('[image] error', error?.status, error?.message, error?.error || error);
-
-    if (error?.status === 400) {
-      return res.status(400).json({ message: 'Invalid image request parameters.' });
-    }
-    if (error?.status === 429) {
-      return res.status(429).json({ message: 'Upstream image rate limit hit. Please retry shortly.' });
-    }
-
-    return res.status(500).json({ message: 'Image generation failed. Please try again.' });
-  }
-});
-
-app.use((err, _req, res, _next) => {
-  if (err?.type === 'entity.too.large') {
-    return res.status(413).json({ message: 'Payload too large. Keep images/text under 16MB.' });
-  }
-  console.error('[unhandled]', err);
-  return res.status(500).json({ message: 'Unexpected server error.' });
-});
-
-app.listen(PORT, () => {
-  console.log(`ThirdEye backend listening on port ${PORT}`);
-});
