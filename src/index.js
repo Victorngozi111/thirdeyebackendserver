@@ -184,7 +184,7 @@ async function fetchJson(url, timeoutMs = 20000) {
   }
 }
 
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'thirdeye-backend',
@@ -353,7 +353,7 @@ app.post(['/audio/speech', '/api/audio/speech'], requireApiKey, async (req, res)
       model: OPENAI_TTS_MODEL,
       voice,
       input,
-      format: 'mp3',
+      response_format: 'mp3',
     });
 
     const buffer = Buffer.from(await audio.arrayBuffer());
@@ -388,7 +388,7 @@ app.get(newsPaths, requireApiKey, async (req, res) => {
   const country = String(req.query?.country || 'us').trim().toLowerCase();
   const language = String(req.query?.language || 'en').trim().toLowerCase();
   const category = String(req.query?.category || 'general').trim().toLowerCase();
-  const query = String(req.query?.q || '').trim();
+  const query = String(req.query?.q || req.query?.query || '').trim();
 
   try {
     const url = buildNewsUrl({ country, language, category, query });
@@ -396,7 +396,7 @@ app.get(newsPaths, requireApiKey, async (req, res) => {
 
     if (!upstream.ok) {
       const upstreamMessage =
-        upstream?.body?.results?.message || upstream?.body?.message || 'News provider error.';
+        upstream?.body?.message || upstream?.body?.error || 'News provider error.';
       return res.status(upstream.status || 502).json({
         error: 'News request failed.',
         message: String(upstreamMessage),
